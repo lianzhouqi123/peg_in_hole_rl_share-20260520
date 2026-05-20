@@ -1,0 +1,969 @@
+import torch
+import numpy as np
+import mujoco_warp as mjw
+from developsuit.envs.pibot_base_env.pibotenv_FC_HF_warp import PiBotEnv, device
+from developsuit.utils.transform_utils_torch import axisangle2quat, quat2mat, mat2eul, quat2axisangle, mat2quat
+
+class CartesianAdmittanceControllerWarp:
+    """完全并行的 GPU 笛卡尔空间导纳控制器"""
+
+    def __init__(self, num_envs, dt=0.01):
+        self.dt = dt
+        self.num_envs = num_envs
+
+        # 将物理参数扩展至 [num_envs, 6] 进行批量计算
+        self.Md = torch.tensor([5.0, 5.0, 5.0, 5.0, 5.0, 5.0], device=device).expand(num_envs, 6)
+        self.Md_inv = 1.0 / self.Md
+        self.default_Dd = torch.tensor([300.0, 300.0, 300.0, 250.0, 250.0, 250.0], device=device)
+        self.default_Kd = torch.tensor([100.0, 100.0, 100.0, 100.0, 100.0, 100.0], device=device)
+        self.Dd = torch.empty((num_envs, 6), device=device)
+        self.Kd = torch.empty((num_envs, 6), device=device)
+        self.Dd.copy_(self.default_Dd.unsqueeze(0))
+        self.Kd.copy_(self.default_Kd.unsqueeze(0))
+
+        self.x_c = torch.zeros((num_envs, 6), device=device)
+        self.x_c_dot = torch.zeros((num_envs, 6), device=device)
+        self.max_trans_err = 0.015
+        self.max_rot_err = 0.15
+        self.max_trans_vel = 0.05
+        self.max_rot_vel = 0.2
+
+    def forward(self, x_d, F_ext, x_d_dot, x_d_ddot):
+        e = self.x_c - x_d
+        e_trans = e[:, 0:3]
+        e_rot = e[:, 3:6]
+
+        trans_norm = torch.linalg.vector_norm(e_trans, dim=-1, keepdim=True)
+        rot_norm = torch.linalg.vector_norm(e_rot, dim=-1, keepdim=True)
+
+        trans_scale = torch.clamp(self.max_trans_err / torch.clamp(trans_norm, min=1e-8), max=1.0)
+        rot_scale = torch.clamp(self.max_rot_err / torch.clamp(rot_norm, min=1e-8), max=1.0)
+
+        e_trans_limited = e_trans * trans_scale
+        e_rot_limited = e_rot * rot_scale
+
+        x_d_limited = x_d.clone()
+        x_d_limited[:, 0:3] = self.x_c[:, 0:3] - e_trans_limited
+        x_d_limited[:, 3:6] = self.x_c[:, 3:6] - e_rot_limited
+
+        e = torch.cat([e_trans_limited, e_rot_limited], dim=-1)
+        de = self.x_c_dot - x_d_dot
+
+        dde = self.Md_inv * (F_ext - self.Dd * de - self.Kd * e)
+        ddxc = x_d_ddot + dde
+
+        self.x_c_dot += ddxc * self.dt
+
+        # 安全保险丝：使用更保守的批量速度限幅，减少精密装配中的来回振荡
+        self.x_c_dot[:, 0:3] = torch.clamp(self.x_c_dot[:, 0:3], -self.max_trans_vel, self.max_trans_vel)
+        self.x_c_dot[:, 3:6] = torch.clamp(self.x_c_dot[:, 3:6], -self.max_rot_vel, self.max_rot_vel)
+
+        self.x_c += self.x_c_dot * self.dt
+        return self.x_c, x_d_limited
+
+    def reset(self):
+        self.x_c.zero_()
+        self.x_c_dot.zero_()
+
+
+class Env(PiBotEnv):
+    def __init__(self, num_envs=1, show_mode="no_show", config={}):
+        self.config = config
+        
+        # ==========================================
+        # 🌟 频率层级划分 (三层齿轮)
+        # ==========================================
+        self.admittance_dt = self.config.get('admittance_dt', 0.01)  # 100Hz 导纳控制器频率
+        self.rl_dt = self.config.get('rl_dt', 0.01)          # 20Hz RL 策略下发频率
+        self.rl_micro_steps = int(self.rl_dt / self.admittance_dt) # = 5 次插值循环
+        
+        # 将导纳频率传给底层，PiBotEnv 内会自行用 0.01/0.002 算出 5 次物理微步
+        super().__init__(num_envs=num_envs, show_mode=show_mode, timestep_control=self.admittance_dt, config=self.config)
+
+        self.history_len = self.config.get('history_len', 5)
+        self.noise_v_linear = self.config.get("noise_v_linear", 0.005)
+        self.noise_v_angular = self.config.get("noise_v_angular", 0.01)
+
+        self.eef_dn_controller = CartesianAdmittanceControllerWarp(num_envs=num_envs, dt=self.admittance_dt)
+
+        self.step_max = self.config.get('step_max', 500)
+
+        # 状态张量
+        self.xd = torch.zeros((num_envs, 6), device=device)
+        self.dxd = torch.zeros((num_envs, 6), device=device)
+        self.dxd_prev = torch.zeros((num_envs, 6), device=device)
+        self.wrench_bias = torch.zeros((num_envs, 6), device=device)
+        self.ctrl_frame_rot_world_from_local = torch.eye(3, dtype=torch.float32, device=device).unsqueeze(0).expand(num_envs, -1, -1).clone()
+        
+        # 🌟 动作插值记忆缓存
+        self.last_action_dxd = torch.zeros((num_envs, 6), device=device)
+        self.last_action_k = torch.zeros((num_envs, 6), device=device)
+
+        self.prev_pos_err = torch.zeros(num_envs, device=device)
+        self.prev_pos_err_vec = torch.zeros((num_envs, 3), dtype=torch.float32, device=device)
+        self.prev_ori_err = torch.zeros(num_envs, device=device)
+        self.i_step = torch.zeros(num_envs, dtype=torch.int32, device=device)
+
+        self.if_touch = True
+        self.de = 0.06
+        self.fd_grp = 45.0
+        self.touch_threshold = 1.0
+
+        self.de_tensor = torch.full((self.num_envs,), self.de, dtype=torch.float32, device=device)
+        self.fd_tensor = torch.full((self.num_envs,), self.fd_grp, dtype=torch.float32, device=device)
+
+        # RL 维度
+        self.kin_obs_dim = 12
+        self.force_obs_dim = 6
+        self.single_obs_dim = self.kin_obs_dim + self.force_obs_dim
+        self.obs_dim = self.single_obs_dim * self.history_len
+        self.action_dim = 12
+        self.obs_history = torch.zeros((self.num_envs, self.history_len, self.single_obs_dim), dtype=torch.float32, device=device)
+
+        # 缩放系数
+        self.scale_pos = torch.tensor(10.0, dtype=torch.float32, device=device)
+        self.scale_ori = torch.tensor(10.0, dtype=torch.float32, device=device)
+        self.scale_vel = torch.tensor([2.0, 2.0, 2.0, 1.0, 1.0, 1.0], dtype=torch.float32, device=device)
+        self.scale_wrench = torch.tensor([1/30.0, 1/30.0, 1/30.0, 1/10.0, 1/10.0, 1/10.0], dtype=torch.float32, device=device)
+
+        action_min = np.asarray(
+            self.config.get('action_min', [-0.01] * 6 + [50.0] * 6),
+            dtype=np.float32,
+        )
+        action_max = np.asarray(
+            self.config.get('action_max', [0.01] * 6 + [200.0] * 6),
+            dtype=np.float32,
+        )
+        self.action_range = (action_min, action_max)
+
+        self.penalty_tensor = torch.tensor(-300.0, dtype=torch.float32, device=device)
+        # 参考旧版无异频 TCN2 训练日志：rl_dt=10ms 且线速度上限为 0.05。
+        # 现在为了真机安全把 action_max 收到了 0.01，单步可产生的位移预算约缩小为 1/5，
+        # 因此需要把 progress 类奖励按位移预算等比例放大，避免被 step penalty 吃掉。
+        ref_step_budget = 0.01 * 0.05
+        curr_step_budget = max(self.rl_dt * float(np.max(action_max[:3])), 1e-6)
+        self.reward_progress_scale = float(np.clip(ref_step_budget / curr_step_budget, 1.0, 8.0))
+        self.reward_progress_scale_tensor = torch.tensor(self.reward_progress_scale, dtype=torch.float32, device=device)
+
+        self.r_step_tensor = torch.tensor(-0.01, dtype=torch.float32, device=device)
+        self.prev_err_z = torch.zeros(num_envs, dtype=torch.float32, device=device)
+
+        # 噪声参数
+        self.obs_noise_range = config.get('obs_noise_range', 0) 
+        self.camera_jitter_pos = config.get('camera_jitter_pos', 0)
+        self.obs_ori_noise_range = config.get('obs_ori_noise_range', 0)
+        self.camera_jitter_ori = config.get('camera_jitter_ori', 0)
+        
+        self.obs_ori_noise = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.obs_pos_noise = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=device)
+        self.xwrench_clean_cache = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=device)
+
+        # 传感器低通滤波 (100Hz 专属)
+        self.ctrl_alpha = self.config.get('ctrl_alpha', 0.12)
+        self.ctrl_f_ext_filtered = torch.zeros((self.num_envs, 6), device=device)
+
+        self.max_delay_steps = config.get('max_delay_steps', 0)
+        self.action_history = torch.zeros((self.num_envs, self.max_delay_steps + 1, self.action_dim), device=device)
+        self.delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self.joint_cmd_dim = 6
+        self.joint_target_rand_enabled = bool(self.config.get('joint_target_rand_enabled', False))
+        self.joint_target_delay_steps_range = self._parse_joint_randomization_range(
+            'joint_target_delay_steps_range', [0, 0], dtype=torch.long
+        )
+        self.joint_target_tau_range = self._parse_joint_randomization_range(
+            'joint_target_tau_range', [0.0, 0.0]
+        )
+        self.joint_target_scale_range = self._parse_joint_randomization_range(
+            'joint_target_scale_range', [1.0, 1.0]
+        )
+        self.joint_target_bias_range = self._parse_joint_randomization_range(
+            'joint_target_bias_range', [0.0, 0.0]
+        )
+        self.joint_target_vel_limit_range = self._parse_joint_randomization_range(
+            'joint_target_vel_limit_range', [1.0e6, 1.0e6]
+        )
+        self.joint_target_deadband_range = self._parse_joint_randomization_range(
+            'joint_target_deadband_range', [0.0, 0.0]
+        )
+        self.joint_target_noise_std = self._parse_joint_randomization_vector(
+            'joint_target_noise_std', 0.0
+        )
+        self.has_joint_target_noise = bool(torch.any(self.joint_target_noise_std > 0).item())
+        self.max_joint_target_delay_steps = int(torch.max(self.joint_target_delay_steps_range[:, 1]).item())
+        self.joint_target_history = torch.zeros(
+            (self.num_envs, self.max_joint_target_delay_steps + 1, self.joint_cmd_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.joint_target_delay_steps = torch.zeros(
+            (self.num_envs, self.joint_cmd_dim), dtype=torch.long, device=device
+        )
+        self.joint_target_tau = torch.zeros((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        self.joint_target_scale = torch.ones((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        self.joint_target_bias = torch.zeros((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        self.joint_target_vel_limit = torch.full(
+            (self.num_envs, self.joint_cmd_dim), 1.0e6, dtype=torch.float32, device=device
+        )
+        self.joint_target_deadband = torch.zeros((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        self.joint_target_exec = torch.zeros((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        self.controller_num_joints = self.controller.integral.shape[1]
+        default_controller_kp = self.controller.default_kp[0]
+        default_controller_damping = self.controller.default_damping_ratio[0]
+        self.controller_gain_rand_enabled = bool(self.config.get('controller_gain_rand_enabled', False))
+        self.controller_gain_integral_scale = float(np.clip(self.config.get('controller_gain_integral_scale', 0.0), 0.0, 1.0))
+        self.controller_kp_range = self._parse_controller_randomization_range(
+            'controller_kp_range', default_controller_kp
+        )
+        self.controller_damping_ratio_range = self._parse_controller_randomization_range(
+            'controller_damping_ratio_range', default_controller_damping
+        )
+        self.drop_fail_window = 5
+        self.touch_fail_history = torch.zeros((self.num_envs, self.drop_fail_window), dtype=torch.bool, device=device)
+        self.touch_fail_history_len = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+
+        # 回滚缓冲区
+        self.target_joints_buf = torch.empty_like(self.arm_qpos)
+        self.prev_xd_buf = torch.empty_like(self.xd)
+        self.prev_dxd_prev_buf = torch.empty_like(self.dxd_prev)
+        self.prev_xc_buf = torch.empty_like(self.eef_dn_controller.x_c)
+        self.prev_xc_dot_buf = torch.empty_like(self.eef_dn_controller.x_c_dot)
+        self.prev_Kd_buf = torch.empty_like(self.eef_dn_controller.Kd)
+        self.prev_Dd_buf = torch.empty_like(self.eef_dn_controller.Dd)
+        self.obs_history_shift_buf = torch.empty((self.num_envs, self.history_len - 1, self.single_obs_dim), dtype=torch.float32, device=device)
+        self.action_history_shift_buf = torch.empty((self.num_envs, self.max_delay_steps, self.action_dim), dtype=torch.float32, device=device)
+        self.joint_target_history_shift_buf = torch.empty(
+            (self.num_envs, self.max_joint_target_delay_steps, self.joint_cmd_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.touch_fail_history_shift_buf = torch.empty((self.num_envs, self.drop_fail_window - 1), dtype=torch.bool, device=device)
+
+        self.get_reward = torch.compile(self.get_reward)
+        self._get_single_frame = torch.compile(self._get_single_frame)
+
+    def _refresh_wrench_clean_cache(self):
+        self.xwrench_clean_cache.copy_(self.wrench_bias)
+        self.xwrench_clean_cache.sub_(self.xwrench_eef_left)
+
+    def _rotate_vec_to_local(self, rot_world_from_local, vec_world):
+        return torch.matmul(rot_world_from_local.transpose(1, 2), vec_world.unsqueeze(-1)).squeeze(-1)
+
+    def _rotate_vec_to_world(self, rot_world_from_local, vec_local):
+        return torch.matmul(rot_world_from_local, vec_local.unsqueeze(-1)).squeeze(-1)
+
+    def _rotate_spatial_to_local(self, rot_world_from_local, spatial_world):
+        return torch.cat([
+            self._rotate_vec_to_local(rot_world_from_local, spatial_world[:, 0:3]),
+            self._rotate_vec_to_local(rot_world_from_local, spatial_world[:, 3:6]),
+        ], dim=-1)
+
+    def _rotate_spatial_to_world(self, rot_world_from_local, spatial_local):
+        return torch.cat([
+            self._rotate_vec_to_world(rot_world_from_local, spatial_local[:, 0:3]),
+            self._rotate_vec_to_world(rot_world_from_local, spatial_local[:, 3:6]),
+        ], dim=-1)
+
+    def _pose_world_to_local(self, pose_world, rot_world_from_local):
+        pos_local = self._rotate_vec_to_local(rot_world_from_local, pose_world[:, 0:3])
+        rotvec_world = quat2axisangle(pose_world[:, 3:7])
+        rotvec_local = self._rotate_vec_to_local(rot_world_from_local, rotvec_world)
+        return torch.cat([pos_local, rotvec_local], dim=-1)
+
+    def _pose_local_to_world(self, pose_local, rot_world_from_local):
+        pos_world = self._rotate_vec_to_world(rot_world_from_local, pose_local[:, 0:3])
+        rotvec_world = self._rotate_vec_to_world(rot_world_from_local, pose_local[:, 3:6])
+        quat_world = axisangle2quat(rotvec_world)
+        return torch.cat([pos_world, quat_world], dim=-1)
+
+    def _reexpress_spatial(self, spatial_old_local, old_rot_world_from_local, new_rot_world_from_local):
+        spatial_world = self._rotate_spatial_to_world(old_rot_world_from_local, spatial_old_local)
+        return self._rotate_spatial_to_local(new_rot_world_from_local, spatial_world)
+
+    def _reexpress_pose(self, pose_old_local, old_rot_world_from_local, new_rot_world_from_local):
+        pose_world = self._pose_local_to_world(pose_old_local, old_rot_world_from_local)
+        return self._pose_world_to_local(pose_world, new_rot_world_from_local)
+
+    def _get_current_ctrl_rot_world_from_local(self):
+        return quat2mat(self.eef_real_pose[:, 3:7])
+
+    def _sync_controller_frame_to_current_local(self):
+        new_rot_world_from_local = self._get_current_ctrl_rot_world_from_local()
+        old_rot_world_from_local = self.ctrl_frame_rot_world_from_local
+
+        self.xd = self._reexpress_pose(self.xd, old_rot_world_from_local, new_rot_world_from_local)
+        self.dxd = self._reexpress_spatial(self.dxd, old_rot_world_from_local, new_rot_world_from_local)
+        self.dxd_prev = self._reexpress_spatial(self.dxd_prev, old_rot_world_from_local, new_rot_world_from_local)
+        self.last_action_dxd = self._reexpress_spatial(
+            self.last_action_dxd, old_rot_world_from_local, new_rot_world_from_local
+        )
+        self.ctrl_f_ext_filtered = self._reexpress_spatial(
+            self.ctrl_f_ext_filtered, old_rot_world_from_local, new_rot_world_from_local
+        )
+        self.eef_dn_controller.x_c = self._reexpress_pose(
+            self.eef_dn_controller.x_c, old_rot_world_from_local, new_rot_world_from_local
+        )
+        self.eef_dn_controller.x_c_dot = self._reexpress_spatial(
+            self.eef_dn_controller.x_c_dot, old_rot_world_from_local, new_rot_world_from_local
+        )
+
+        if self.max_delay_steps > 0:
+            for idx in range(self.action_history.shape[1]):
+                self.action_history[:, idx, 0:6] = self._reexpress_spatial(
+                    self.action_history[:, idx, 0:6], old_rot_world_from_local, new_rot_world_from_local
+                )
+
+        self.ctrl_frame_rot_world_from_local.copy_(new_rot_world_from_local)
+
+    def _get_eef_real_wrench_local(self, eef_real_rot_world_from_local):
+        return self._rotate_spatial_to_local(eef_real_rot_world_from_local, self.xwrench_clean)
+
+    def _parse_joint_randomization_range(self, key, default, dtype=torch.float32):
+        value = self.config.get(key, default)
+        tensor = torch.as_tensor(value, dtype=dtype, device=device)
+
+        if tensor.ndim == 0:
+            tensor = tensor.repeat(self.joint_cmd_dim)
+            return torch.stack([tensor, tensor], dim=-1)
+
+        if tensor.ndim == 1:
+            if tensor.shape[0] == 2:
+                return tensor.view(1, 2).repeat(self.joint_cmd_dim, 1)
+            if tensor.shape[0] == self.joint_cmd_dim:
+                return torch.stack([tensor, tensor], dim=-1)
+
+        if tensor.ndim == 2 and tensor.shape == (self.joint_cmd_dim, 2):
+            lower = torch.minimum(tensor[:, 0], tensor[:, 1])
+            upper = torch.maximum(tensor[:, 0], tensor[:, 1])
+            return torch.stack([lower, upper], dim=-1)
+
+        raise ValueError(
+            f"{key} must be a scalar, shape [2], shape [{self.joint_cmd_dim}], or shape [{self.joint_cmd_dim}, 2]"
+        )
+
+    def _parse_joint_randomization_vector(self, key, default):
+        value = self.config.get(key, default)
+        tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+
+        if tensor.ndim == 0:
+            return tensor.repeat(self.joint_cmd_dim)
+
+        if tensor.ndim == 1 and tensor.shape[0] == self.joint_cmd_dim:
+            return tensor
+
+        raise ValueError(f"{key} must be a scalar or shape [{self.joint_cmd_dim}]")
+
+    def _sample_joint_randomization_range(self, range_tensor):
+        lower = range_tensor[:, 0].unsqueeze(0)
+        upper = range_tensor[:, 1].unsqueeze(0)
+        rand = torch.rand((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        return lower + rand * (upper - lower)
+
+    def _sample_joint_randomization_int_range(self, range_tensor):
+        lower = range_tensor[:, 0].unsqueeze(0)
+        upper = range_tensor[:, 1].unsqueeze(0)
+        span = upper - lower + 1
+        rand = torch.rand((self.num_envs, self.joint_cmd_dim), dtype=torch.float32, device=device)
+        return lower + torch.floor(rand * span.to(torch.float32)).to(torch.long)
+
+    def _parse_controller_randomization_range(self, key, default):
+        value = self.config.get(key, default)
+        tensor = torch.as_tensor(value, dtype=torch.float32, device=device)
+
+        if tensor.ndim == 0:
+            tensor = tensor.repeat(self.controller_num_joints)
+            return torch.stack([tensor, tensor], dim=-1)
+
+        if tensor.ndim == 1:
+            if tensor.shape[0] == 2:
+                return tensor.view(1, 2).repeat(self.controller_num_joints, 1)
+            if tensor.shape[0] == self.controller_num_joints:
+                return torch.stack([tensor, tensor], dim=-1)
+
+        if tensor.ndim == 2 and tensor.shape == (self.controller_num_joints, 2):
+            lower = torch.minimum(tensor[:, 0], tensor[:, 1])
+            upper = torch.maximum(tensor[:, 0], tensor[:, 1])
+            return torch.stack([lower, upper], dim=-1)
+
+        raise ValueError(
+            f"{key} must be a scalar, shape [2], shape [{self.controller_num_joints}], "
+            f"or shape [{self.controller_num_joints}, 2]"
+        )
+
+    def _sample_controller_randomization_range(self, range_tensor):
+        lower = range_tensor[:, 0].unsqueeze(0)
+        upper = range_tensor[:, 1].unsqueeze(0)
+        rand = torch.rand((self.num_envs, self.controller_num_joints), dtype=torch.float32, device=device)
+        return lower + rand * (upper - lower)
+
+    def _reset_controller_gain_randomizer(self, env_mask):
+        mask_2d = env_mask.unsqueeze(-1)
+
+        sampled_kp = self._sample_controller_randomization_range(self.controller_kp_range)
+        sampled_damping_ratio = self._sample_controller_randomization_range(self.controller_damping_ratio_range)
+        sampled_kp = torch.clamp(sampled_kp, min=1e-3)
+        sampled_damping_ratio = torch.clamp(sampled_damping_ratio, min=1e-4)
+
+        if not self.controller_gain_rand_enabled:
+            sampled_kp = self.controller.default_kp
+            sampled_damping_ratio = self.controller.default_damping_ratio
+
+        self.controller.set_pd_gains(
+            kp=sampled_kp,
+            damping_ratio=sampled_damping_ratio,
+            env_mask=env_mask,
+        )
+
+        if self.controller_gain_rand_enabled:
+            scaled_integral = self.controller.integral * self.controller_gain_integral_scale
+            self.controller.integral = torch.where(mask_2d, scaled_integral, self.controller.integral)
+
+    def _reset_joint_target_randomizer(self, env_mask):
+        mask_2d = env_mask.unsqueeze(-1)
+        mask_3d = env_mask.view(-1, 1, 1)
+        current_joint_q = self.arm_qpos[:, 0:self.joint_cmd_dim]
+        history_fill = current_joint_q.unsqueeze(1).expand(-1, self.max_joint_target_delay_steps + 1, -1)
+
+        self.joint_target_history = torch.where(mask_3d, history_fill, self.joint_target_history)
+        self.joint_target_exec = torch.where(mask_2d, current_joint_q, self.joint_target_exec)
+
+        sampled_delay = self._sample_joint_randomization_int_range(self.joint_target_delay_steps_range)
+        sampled_tau = torch.clamp(self._sample_joint_randomization_range(self.joint_target_tau_range), min=0.0)
+        sampled_scale = self._sample_joint_randomization_range(self.joint_target_scale_range)
+        sampled_bias = self._sample_joint_randomization_range(self.joint_target_bias_range)
+        sampled_vel_limit = torch.clamp(self._sample_joint_randomization_range(self.joint_target_vel_limit_range), min=0.0)
+        sampled_deadband = torch.clamp(self._sample_joint_randomization_range(self.joint_target_deadband_range), min=0.0)
+
+        if not self.joint_target_rand_enabled:
+            sampled_delay.zero_()
+            sampled_tau.zero_()
+            sampled_scale.fill_(1.0)
+            sampled_bias.zero_()
+            sampled_vel_limit.fill_(1.0e6)
+            sampled_deadband.zero_()
+
+        self.joint_target_delay_steps = torch.where(mask_2d, sampled_delay, self.joint_target_delay_steps)
+        self.joint_target_tau = torch.where(mask_2d, sampled_tau, self.joint_target_tau)
+        self.joint_target_scale = torch.where(mask_2d, sampled_scale, self.joint_target_scale)
+        self.joint_target_bias = torch.where(mask_2d, sampled_bias, self.joint_target_bias)
+        self.joint_target_vel_limit = torch.where(mask_2d, sampled_vel_limit, self.joint_target_vel_limit)
+        self.joint_target_deadband = torch.where(mask_2d, sampled_deadband, self.joint_target_deadband)
+
+    def _apply_joint_target_randomizer(self, target_q):
+        if not self.joint_target_rand_enabled:
+            return target_q
+
+        if self.max_joint_target_delay_steps > 0:
+            self.joint_target_history_shift_buf.copy_(self.joint_target_history[:, :-1])
+            self.joint_target_history[:, 1:].copy_(self.joint_target_history_shift_buf)
+        self.joint_target_history[:, 0].copy_(target_q)
+
+        gather_index = self.joint_target_delay_steps.unsqueeze(1)
+        delayed_target = torch.gather(self.joint_target_history, 1, gather_index).squeeze(1)
+        commanded_target = delayed_target * self.joint_target_scale + self.joint_target_bias
+
+        q_error = commanded_target - self.joint_target_exec
+        q_error = torch.where(torch.abs(q_error) <= self.joint_target_deadband, 0.0, q_error)
+
+        alpha = self.admittance_dt / torch.clamp(self.joint_target_tau + self.admittance_dt, min=self.admittance_dt)
+        alpha = torch.clamp(alpha, 0.0, 1.0)
+        delta_q = alpha * q_error
+
+        max_delta = torch.clamp(self.joint_target_vel_limit, min=0.0) * self.admittance_dt
+        delta_q = torch.clamp(delta_q, -max_delta, max_delta)
+
+        self.joint_target_exec.add_(delta_q)
+        if self.has_joint_target_noise:
+            self.joint_target_exec.add_(torch.randn_like(self.joint_target_exec) * self.joint_target_noise_std)
+
+        return self.joint_target_exec
+
+    def reset(self, if_reset_data=False, if_vise_open_rdm=False, if_vise_base_rdm=False, env_mask=None):
+        is_global_reset = env_mask is None
+        if env_mask is None:
+            env_mask = torch.ones(self.num_envs, dtype=torch.bool, device=device)
+
+        mask_2d = env_mask.unsqueeze(-1)
+
+        # 1. 调用父类重置底层物理状态 (这步会产生 self.sampled_idx)
+        super().reset(if_reset_data=if_reset_data, if_vise_open_rdm=if_vise_open_rdm, if_vise_base_rdm=if_vise_base_rdm, env_mask=env_mask)
+        self._reset_controller_gain_randomizer(env_mask)
+
+        # ==========================================
+        # 🌟 修改点 1：提取并应用 wrench_bias
+        # ==========================================
+        loaded_wrench_bias = False
+        if if_reset_data:
+            if hasattr(self, 'is_state_pool') and self.is_state_pool and 'wrench_bias' in self.state_pool:
+                if hasattr(self, 'sampled_idx'):
+                    self.wrench_bias[:] = torch.where(mask_2d, self.state_pool['wrench_bias'][self.sampled_idx], self.wrench_bias)
+                    loaded_wrench_bias = True
+                else:
+                    print("⚠️ 警告: 状态池包含 wrench_bias，但父类未公开 sampled_idx，无法对齐加载！")
+            elif hasattr(self, 'reset_data') and self.reset_data is not None and 'wrench_bias' in self.reset_data:
+                wb_tgt = torch.tensor(self.reset_data['wrench_bias'], dtype=torch.float32, device=device).expand(self.num_envs, -1)
+                self.wrench_bias[:] = torch.where(mask_2d, wb_tgt, self.wrench_bias)
+                loaded_wrench_bias = True
+
+        self._refresh_wrench_clean_cache()
+
+        # 提取当前控制工具点坐标 (用于常规重置)
+        # 这里与 numpy 版保持一致，使用 xpose_left 作为导纳状态的世界系来源。
+        current_pose = self.xpose_left
+        current_ctrl_rot_world_from_local = self._get_current_ctrl_rot_world_from_local()
+        self.ctrl_frame_rot_world_from_local = torch.where(
+            mask_2d.unsqueeze(-1),
+            current_ctrl_rot_world_from_local,
+            self.ctrl_frame_rot_world_from_local,
+        )
+        new_xd = self._pose_world_to_local(current_pose, current_ctrl_rot_world_from_local)
+
+        # ==========================================
+        # 🌟 修改点 2：高层导纳控制器状态的恢复与继承
+        # ==========================================
+        # 分支 C: 常规重置，清空弹簧，锚定当前位置
+        self.xd = torch.where(mask_2d, new_xd, self.xd)
+        self.dxd_prev = torch.where(mask_2d, 0.0, self.dxd_prev)
+        self.eef_dn_controller.x_c = torch.where(mask_2d, new_xd, self.eef_dn_controller.x_c)
+        self.eef_dn_controller.x_c_dot = torch.where(mask_2d, 0.0, self.eef_dn_controller.x_c_dot)
+
+        self.eef_dn_controller.Kd = torch.where(mask_2d, self.eef_dn_controller.default_Kd, self.eef_dn_controller.Kd)
+        self.eef_dn_controller.Dd = torch.where(mask_2d, self.eef_dn_controller.default_Dd, self.eef_dn_controller.Dd)
+        
+        # 动作缓存清零
+        self.last_action_dxd = torch.where(mask_2d, 0.0, self.last_action_dxd)
+        self.last_action_k = torch.where(mask_2d, self.eef_dn_controller.default_Kd, self.last_action_k)
+
+        new_noise = torch.empty((self.num_envs, 3), device=device).uniform_(-self.obs_noise_range, self.obs_noise_range)
+        self.obs_pos_noise = torch.where(mask_2d, new_noise, self.obs_pos_noise)
+
+        new_ori_noise = torch.empty((self.num_envs, 3), device=device).uniform_(-self.obs_ori_noise_range, self.obs_ori_noise_range)
+        self.obs_ori_noise = torch.where(mask_2d, new_ori_noise, self.obs_ori_noise)
+        
+        current_wrench_local = self._get_eef_real_wrench_local(current_ctrl_rot_world_from_local)
+        self.ctrl_f_ext_filtered = torch.where(mask_2d, current_wrench_local, self.ctrl_f_ext_filtered)
+
+        new_delay = torch.randint(0, self.max_delay_steps + 1, (self.num_envs,), device=device)
+        self.delay_steps = torch.where(env_mask, new_delay, self.delay_steps)
+
+        mask_3d = mask_2d.unsqueeze(-1) 
+        self.action_history = torch.where(mask_3d, 0.0, self.action_history)
+        self._reset_joint_target_randomizer(env_mask)
+        drop_mask_2d = env_mask.unsqueeze(-1)
+        self.touch_fail_history = torch.where(drop_mask_2d, False, self.touch_fail_history)
+        self.touch_fail_history_len = torch.where(env_mask, 0, self.touch_fail_history_len)
+
+        if self.noise_v_angular > 0.0 or self.noise_v_linear > 0.0:
+            noise_linear = torch.empty((self.num_envs, 3), device=device).uniform_(-self.noise_v_linear, self.noise_v_linear)
+            noise_angular = torch.empty((self.num_envs, 3), device=device).uniform_(-self.noise_v_angular, self.noise_v_angular)
+            noise_dxd = torch.cat([noise_linear, noise_angular], dim=-1)
+            noise_dxd_world = self._rotate_spatial_to_world(current_ctrl_rot_world_from_local, noise_dxd)
+
+            jac = self.left_site_jac
+            jac_T = jac.transpose(1, 2)
+            
+            lambda_sq = 1e-4  
+            eye = torch.eye(6, device=device).expand(self.num_envs, 6, 6)
+            A = torch.bmm(jac_T, jac) + lambda_sq * eye
+            B = torch.bmm(jac_T, noise_dxd_world.unsqueeze(-1))
+            
+            noise_dq = torch.linalg.solve(A, B).squeeze(-1)
+            noise_dq = torch.nan_to_num(noise_dq, nan=0.0)
+
+            self.dxd = torch.where(mask_2d, noise_dxd, self.dxd)
+            self.last_action_dxd = torch.where(mask_2d, noise_dxd, self.last_action_dxd)
+            self.eef_dn_controller.x_c_dot = torch.where(mask_2d, noise_dxd, self.eef_dn_controller.x_c_dot)
+
+            noise_qvel = torch.zeros((self.num_envs, self.mj_model.nv), device=device)
+            noise_qvel[:, self.arm.joint_left_dof_adrs] = noise_dq
+            self.qvel_torch[:] = torch.where(mask_2d, self.qvel_torch + noise_qvel, self.qvel_torch)
+
+            self.fast_forward()
+        else:
+            self.dxd = torch.where(mask_2d, 0.0, self.dxd)
+            self.last_action_dxd = torch.where(mask_2d, 0.0, self.last_action_dxd)
+            self.eef_dn_controller.x_c_dot = torch.where(mask_2d, 0.0, self.eef_dn_controller.x_c_dot)
+
+        # ==========================================
+        # 🌟 修改点 3：如果有导入的 bias，直接跳过空载步进
+        # ==========================================
+        if is_global_reset and not loaded_wrench_bias:
+            self.wrench_bias.zero_()
+            for _ in range(10):
+                self.step_physics_only()
+                self.wrench_bias += self.xwrench_eef_left_raw
+            self.wrench_bias /= 10.0
+            self._refresh_wrench_clean_cache()
+
+        g_pose = self.grasp_pose
+        i_pose = self.insert_pose
+        insert_world_pose = self.insert_world_pose
+        rot_align = quat2mat(insert_world_pose[:, 3:7])
+
+        new_prev_pos_err_vec_world = g_pose[:, 0:3] - i_pose[:, 0:3]
+        new_prev_pos_err_vec = self._rotate_vec_to_local(rot_align, new_prev_pos_err_vec_world)
+        new_prev_pos_err = torch.norm(new_prev_pos_err_vec, dim=-1)
+        rot_g = quat2mat(g_pose[:, 3:7])
+        rot_i = quat2mat(i_pose[:, 3:7])
+        rot_err = torch.bmm(rot_i.transpose(1, 2), rot_g)
+        ori_err_vec_insert = quat2axisangle(mat2quat(rot_err))
+        ori_err_vec_world = self._rotate_vec_to_world(rot_i, ori_err_vec_insert)
+        ori_err_vec_align = self._rotate_vec_to_local(rot_align, ori_err_vec_world)
+        new_prev_ori_err = torch.norm(ori_err_vec_align, dim=-1)
+
+        self.prev_pos_err_vec = torch.where(mask_2d, new_prev_pos_err_vec, self.prev_pos_err_vec)
+        self.prev_pos_err = torch.where(env_mask, new_prev_pos_err, self.prev_pos_err)
+        self.prev_ori_err = torch.where(env_mask, new_prev_ori_err, self.prev_ori_err)
+        err_z_init = torch.abs(new_prev_pos_err_vec[:, 2])
+        self.prev_err_z = torch.where(env_mask, err_z_init, self.prev_err_z)
+
+        initial_frame = self._get_single_frame()
+        mask_3d = env_mask.view(-1, 1, 1) 
+        initial_frame_expanded = initial_frame.unsqueeze(1).expand(-1, self.history_len, -1)
+        self.obs_history = torch.where(mask_3d, initial_frame_expanded, self.obs_history)
+
+        self.i_step = torch.where(env_mask, 0, self.i_step)
+
+    def step_physics_only(self):
+        self.target_joints_buf.copy_(self.arm_qpos)
+        self.touch_ctrl(self.target_joints_buf, self.de_tensor, self.fd_tensor)
+        self.physics_step()
+        self._refresh_wrench_clean_cache()
+
+    def step(self, action, if_change_k=True):
+        is_numpy = isinstance(action, np.ndarray)
+        if is_numpy:
+            action = torch.tensor(action, dtype=torch.float32, device=device)
+
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+
+        self._sync_controller_frame_to_current_local()
+        ctrl_rot_world_from_local = self.ctrl_frame_rot_world_from_local.clone()
+
+        # 1. 延迟模拟 (在 20Hz 级别处理历史队列)
+        if self.max_delay_steps > 0:
+            self.action_history_shift_buf.copy_(self.action_history[:, :-1])
+            self.action_history[:, 1:].copy_(self.action_history_shift_buf)
+        self.action_history[:, 0] = action 
+
+        delayed_action = self.action_history[self.ik_batch_idx, self.delay_steps]
+        dxd_target = delayed_action[:, 0:6]
+        k_target = delayed_action[:, 6:12]
+
+        # 2. 计算插值步长 (从上一帧到当前目标的差值切分)
+        dxd_step = (dxd_target - self.last_action_dxd) / self.rl_micro_steps
+        k_step = (k_target - self.last_action_k) / self.rl_micro_steps
+
+        # 用于累计本回合 5 个微步内的失败掩码
+        accumulated_ik_fail = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        accumulated_drop_fail = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+
+        # ==========================================
+        # 🌟 100Hz 导纳控制器插值执行循环
+        # ==========================================
+        for i in range(self.rl_micro_steps):
+            # 获取当前插值点
+            interp_dxd = self.last_action_dxd + dxd_step * (i + 1)
+            interp_k = self.last_action_k + k_step * (i + 1)
+
+            # --- IK 失败保护：备份当前微步状态 ---
+            self.prev_xd_buf.copy_(self.xd)
+            self.prev_dxd_prev_buf.copy_(self.dxd_prev)
+            self.prev_xc_buf.copy_(self.eef_dn_controller.x_c)
+            self.prev_xc_dot_buf.copy_(self.eef_dn_controller.x_c_dot)
+            self.prev_Kd_buf.copy_(self.eef_dn_controller.Kd)
+            self.prev_Dd_buf.copy_(self.eef_dn_controller.Dd)
+
+            # 更新目标位置
+            ddxd = (interp_dxd - self.dxd_prev) / self.admittance_dt
+            self.dxd_prev.copy_(interp_dxd)
+            self.xd = self.xd + interp_dxd * self.admittance_dt
+
+            # 100Hz 专属传感器低通滤波
+            current_noisy_wrench_local = self._get_eef_real_wrench_local(ctrl_rot_world_from_local)
+            self.ctrl_f_ext_filtered = (
+                self.ctrl_alpha * current_noisy_wrench_local
+                + (1 - self.ctrl_alpha) * self.ctrl_f_ext_filtered
+            )
+
+            # 更新导纳刚度和阻尼
+            m_diag = self.eef_dn_controller.Md
+            k_safe = torch.clamp(interp_k, min=1e-3)
+            d_diag = 3.5 * torch.sqrt(m_diag * k_safe)
+
+            if if_change_k:
+                self.eef_dn_controller.Kd = k_safe
+                self.eef_dn_controller.Dd = d_diag
+
+            # 执行导纳运算
+            xc, self.xd = self.eef_dn_controller.forward(
+                x_d=self.xd,
+                F_ext=self.ctrl_f_ext_filtered,
+                x_d_dot=interp_dxd,
+                x_d_ddot=ddxd
+            )
+
+            pose_d = self._pose_local_to_world(xc, ctrl_rot_world_from_local)
+
+            # 解析逆运动学
+            nearest_q = self.ikine_analytical_left_torch(pose_d)
+            ik_fail_mask = torch.all(nearest_q == self.arm_qpos[:, 0:6], dim=-1)
+
+            # --- IK 失败惩罚与回滚 ---
+            mask_2d = ik_fail_mask.unsqueeze(-1)
+            self.xd = torch.where(mask_2d, self.prev_xd_buf, self.xd)
+            self.dxd_prev = torch.where(mask_2d, self.prev_dxd_prev_buf, self.dxd_prev)
+            self.eef_dn_controller.x_c = torch.where(mask_2d, self.prev_xc_buf, self.eef_dn_controller.x_c)
+            self.eef_dn_controller.x_c_dot = torch.where(mask_2d, self.prev_xc_dot_buf, self.eef_dn_controller.x_c_dot)
+            self.eef_dn_controller.Kd = torch.where(mask_2d, self.prev_Kd_buf, self.eef_dn_controller.Kd)
+            self.eef_dn_controller.Dd = torch.where(mask_2d, self.prev_Dd_buf, self.eef_dn_controller.Dd)
+
+            q7 = self.arm_qpos[:, 6:7]
+            target_joints_left = self._apply_joint_target_randomizer(nearest_q)
+            target_joints = torch.cat([target_joints_left, q7], dim=-1)
+
+            # 触发控制、物理引擎计算及力觉清理 (走 5 次 500Hz)
+            self.touch_ctrl(target_joints, self.de_tensor, self.fd_tensor)
+            self.physics_step()
+            self._refresh_wrench_clean_cache()
+
+            # 累计 20Hz 视窗内的报错标志位
+            accumulated_ik_fail |= ik_fail_mask
+            self.touch_fail_history_shift_buf.copy_(self.touch_fail_history[:, 1:])
+            self.touch_fail_history[:, :-1].copy_(self.touch_fail_history_shift_buf)
+            self.touch_fail_history[:, -1] = torch.mean(self.left_touch_force, dim=-1) < self.touch_threshold
+            self.touch_fail_history_len = torch.clamp(self.touch_fail_history_len + 1, max=self.drop_fail_window)
+            history_is_full = self.touch_fail_history_len >= self.drop_fail_window
+            accumulated_drop_fail |= history_is_full & torch.all(self.touch_fail_history, dim=-1)
+
+        # 3. 本回合插值结束，更新记忆
+        self._sync_controller_frame_to_current_local()
+        dxd_target = self._reexpress_spatial(
+            dxd_target, ctrl_rot_world_from_local, self.ctrl_frame_rot_world_from_local
+        )
+        self.last_action_dxd.copy_(dxd_target)
+        self.last_action_k.copy_(k_target)
+        self.dxd.copy_(dxd_target)  # 保持属性兼容性
+
+        # ==========================================
+        # 4. 20Hz 视觉观测刷新与 Reward 计算
+        # ==========================================
+        current_frame = self._get_single_frame()
+        self.obs_history_shift_buf.copy_(self.obs_history[:, 1:])
+        self.obs_history[:, :-1].copy_(self.obs_history_shift_buf)
+        self.obs_history[:, -1] = current_frame
+
+        next_obs = self.get_observation()
+        reward, is_success, info = self.get_reward()
+
+        current_pos_err = torch.norm(self.grasp_pose[:, 0:3] - self.insert_pose[:, 0:3], dim=-1)
+        is_nan_mask = torch.isnan(current_pos_err)
+        runaway_mask = current_pos_err > 0.4
+        
+        # 使用累积的 fail mask 作为死亡判据
+        fail_mask = accumulated_ik_fail | accumulated_drop_fail | runaway_mask | is_nan_mask
+        
+        reward = torch.where(fail_mask, self.penalty_tensor, reward)
+        reward = torch.nan_to_num(reward, nan=-50.0)
+        is_success = is_success & (~fail_mask)
+
+        info['ik_fail'] = accumulated_ik_fail
+        info['drop_fail'] = accumulated_drop_fail
+        info['runaway_fail'] = runaway_mask
+
+        self.i_step += 1
+        time_limit_mask = (~(is_success | fail_mask)) & (self.i_step >= self.step_max - 1)
+        done = is_success | fail_mask | time_limit_mask
+        info['time_limit'] = time_limit_mask
+
+        if is_numpy and self.num_envs == 1:
+            info_single = {k: v.cpu().item() if isinstance(v, torch.Tensor) and v.numel() == 1 else v
+                           for k, v in info.items()}
+            return next_obs.cpu().numpy().squeeze(), reward.cpu().item(), done.cpu().item(), info_single
+
+        return next_obs, reward, done, info
+    
+    def _get_single_frame(self):
+        """计算当前物理步的单帧 18 维特征 (带有严格的数值缩放)"""
+        g_pose = self.xpose_left
+        i_pose = self.insert_pose
+        eef_real_rot_world_from_local = self._get_current_ctrl_rot_world_from_local()
+
+        # 1. 基础误差计算与加噪
+        true_pos_err_world = g_pose[:, 0:3] - i_pose[:, 0:3]
+        true_pos_err = self._rotate_vec_to_local(eef_real_rot_world_from_local, true_pos_err_world)
+        obs_pos_err = true_pos_err + self.obs_pos_noise
+        
+        rot_g = quat2mat(g_pose[:, 3:7])
+        rot_i = quat2mat(i_pose[:, 3:7])
+        rot_err = torch.bmm(rot_i.transpose(1, 2), rot_g)
+        true_euler_err, _ = mat2eul(rot_err)
+        true_euler_err = self._rotate_vec_to_local(eef_real_rot_world_from_local, true_euler_err)
+        obs_euler_err = true_euler_err + self.obs_ori_noise
+
+        camera_jitter_pos = torch.empty((self.num_envs, 3), device=device).uniform_(-self.camera_jitter_pos, self.camera_jitter_pos)
+        obs_pos_err += camera_jitter_pos
+
+        camera_jitter_ori = torch.empty((self.num_envs, 3), device=device).uniform_(-self.camera_jitter_ori, self.camera_jitter_ori)
+        obs_euler_err += camera_jitter_ori
+
+        current_vel = self.eef_dn_controller.x_c_dot
+
+        # 2. 获取原始力觉 (经过了第一道轻度硬件滤波的有色噪声)
+        f_ext_local = self._get_eef_real_wrench_local(eef_real_rot_world_from_local)
+
+        # ==========================================
+        # 🌟 3. 执行归一化缩放 (将所有数值强压至 [-1, 1] 附近)
+        # ==========================================
+        obs_pos_err_scaled = obs_pos_err * self.scale_pos
+        obs_euler_err_scaled = obs_euler_err * self.scale_ori
+        current_vel_scaled = current_vel * self.scale_vel
+        f_ext_scaled = f_ext_local * self.scale_wrench
+
+        # 4. 拼接最终的单帧观测 (总维度: 3+3+6+6 = 18)
+        single_obs = torch.cat([
+            obs_pos_err_scaled, 
+            obs_euler_err_scaled, 
+            current_vel_scaled, 
+            f_ext_scaled
+        ], dim=-1)
+        
+        # 极小瑕疵护盾
+        single_obs = torch.nan_to_num(single_obs, nan=0.0)
+        
+        # 🚨 绝对安全锁：切断任何超出 [-5.0, 5.0] 的极端离群值，彻底保护梯度
+        single_obs = torch.clamp(single_obs, min=-5.0, max=5.0)
+        
+        return single_obs
+
+    def get_observation(self):
+        """返回展平的历史堆叠特征 [num_envs, 90] 喂给神经网络"""
+        return self.obs_history.view(self.num_envs, -1)
+    
+    def get_reward(self):
+        g_pose = self.grasp_pose
+        i_pose = self.insert_pose
+        insert_world_pose = self.insert_world_pose
+
+        # ==========================================
+        # 1. 以 insert_pose 为目标，以 insert_world_pose 为对齐坐标系
+        #    只对齐方向，不改变插入点原点定义。
+        # ==========================================
+        rot_align = quat2mat(insert_world_pose[:, 3:7])
+        pos_err_vec_world = g_pose[:, 0:3] - i_pose[:, 0:3]
+        pos_err_vec = self._rotate_vec_to_local(rot_align, pos_err_vec_world)
+        pos_err = torch.norm(pos_err_vec, dim=-1)
+        curr_dist_xy = torch.norm(pos_err_vec[:, :2], dim=-1)
+        prev_dist_xy = torch.norm(self.prev_pos_err_vec[:, :2], dim=-1)
+
+        rot_g = quat2mat(g_pose[:, 3:7])
+        rot_i = quat2mat(i_pose[:, 3:7])
+        rot_err = torch.bmm(rot_i.transpose(1, 2), rot_g)
+        ori_err_vec_insert = quat2axisangle(mat2quat(rot_err))
+        ori_err_vec_world = self._rotate_vec_to_world(rot_i, ori_err_vec_insert)
+        ori_err_vec = self._rotate_vec_to_local(rot_align, ori_err_vec_world)
+        ori_err = torch.norm(ori_err_vec, dim=-1)
+
+        # ==========================================
+        # 🌟 2. 误差分量直接在 insert_world_site 坐标系下读取
+        #     该系与虎钳固连，且 -Z 为插入方向。
+        # ==========================================
+        err_x = torch.abs(pos_err_vec[:, 0])
+        err_y = torch.abs(pos_err_vec[:, 1])
+        err_z = torch.abs(pos_err_vec[:, 2])
+
+        # ==========================================
+        # 3. 接触力惩罚
+        # ==========================================
+        force_norm = torch.abs(self.vise_touch)
+        force_eef_norm = torch.norm(self.xwrench_clean, dim=-1)
+
+        # 只对 XY 平面距离给位置引力，让策略先学会平面找孔，再由深度奖励处理 Z 轴插入。
+        r_xy_progress = 2000 * (prev_dist_xy - curr_dist_xy)
+
+        # 动态接触力阈值 (越靠近洞口，允许的摩擦力越大)
+        dynamic_force_threshold = 15.0 + 30.0 * torch.clamp(1.0 - (curr_dist_xy / 0.05), min=0.0, max=1.0)
+        raw_force_penalty = -0.05 * torch.clamp(force_eef_norm - dynamic_force_threshold, min=0.0)
+
+        # ==========================================
+        # 修改 2：动态姿态奖励 (靠得越近，姿态越值钱)
+        # ==========================================
+        # 当 XY 距离小于 2cm 时，说明已经在洞口边缘了，此时猛烈奖励姿态对齐！
+        is_near_hole = (curr_dist_xy < 0.02).float()
+        # 基础给 10 分，如果在洞口边缘，再暴增 30 分的权重，逼迫它旋转！
+        dynamic_ori_coef = 1500 + 3000 * is_near_hole
+        r_ori_progress = dynamic_ori_coef * (self.prev_ori_err - ori_err)
+
+        # 稍微减轻初期的接触力惩罚，防止它过度害怕
+        raw_force_penalty = -0.02 * torch.clamp(force_eef_norm - dynamic_force_threshold, min=0.0)
+
+        # 盲搜阶段大幅放宽力惩罚，防止策略因为接触摩擦而学会“逃跑”。
+        is_searching_blindly = (curr_dist_xy > 0.015).float()
+        penalty_scale = 1.0 - 0.9 * is_searching_blindly
+        r_force_penalty = penalty_scale * raw_force_penalty
+
+        # ==========================================
+        # 4. 成功判定与专属深度奖励
+        # ==========================================
+        is_deep_enough = err_z < 0.002 
+        is_y_aligned = err_y < 0.003 
+        is_x_in_slot = err_x < 0.003
+        is_ori_correct = ori_err < 0.1
+
+        is_success = is_deep_enough & is_y_aligned & is_x_in_slot & is_ori_correct
+        r_success = is_success.float() * 300.0
+
+        # 分阶段的 Z 轴奖励：
+        is_in_chamfer = (err_x < 0.015) & (err_y < 0.015)
+        
+        # 只要还没进入倒角，就一直鼓励靠近（无论高度是多少）
+        r_z_approach = 1000 * (self.prev_err_z - err_z) * (~is_in_chamfer).float()
+
+        # 进入倒角后，切换为按旧版 10ms TCN2 日志等比例放大的高敏感插入奖励
+        r_depth_insert = 5000 * (self.prev_err_z - err_z) * is_in_chamfer.float()
+
+        r_depth_progress = r_z_approach + r_depth_insert
+
+        # ==========================================
+        # 🌟 核心修改 2：加入无情的“反卡死 (Anti-Stuck)”电击惩罚
+        # ==========================================
+        # 计算当前末端的真实绝对速度
+        current_vel_norm = torch.norm(self.eef_dn_controller.x_c_dot[:, 0:3], dim=-1)
+        
+        # 判据：如果还没插到底 (err_z > 0.01)，且速度几乎静止 (< 0.005m/s)
+        is_stuck = (err_z > 0.025) & (current_vel_norm < 0.005)
+        
+        # 只要你敢卡在边缘装死，每步扣 2 分！逼迫网络左右扭动！
+        r_stuck_penalty = -0. * is_stuck.float()
+
+        # ==========================================
+        # 5. 状态更新与奖励合并
+        # ==========================================
+        self.prev_err_z.copy_(err_z)
+        self.prev_pos_err_vec.copy_(pos_err_vec)
+        self.prev_pos_err.copy_(pos_err)
+        self.prev_ori_err.copy_(ori_err)
+
+        reward = r_xy_progress + r_ori_progress + r_force_penalty + r_success + self.r_step_tensor + r_depth_progress + r_stuck_penalty
+
+        # 加上硬截断，防止单步优势爆炸
+        reward = torch.clamp(reward, min=-100.0, max=500.0)
+
+        info = {
+            'is_success': is_success,
+            'pos_err': pos_err,
+            'dist_xy': curr_dist_xy,
+            'ori_err': ori_err,
+            'force_norm': force_norm,
+            'penalty_scale': penalty_scale,
+            'reward_progress_scale': self.reward_progress_scale_tensor,
+            'r_z_approach': r_z_approach,
+            # 将 r_depth_progress 也加入监控面板，方便你观察它有没有被吃到
+            'r_components': (self.r_step_tensor, r_xy_progress, r_ori_progress, r_force_penalty, r_depth_progress)
+        }
+
+        return reward, is_success, info
+    
+    @property
+    def xwrench_clean(self):
+        return self.xwrench_clean_cache

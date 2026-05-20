@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment
+.env
+.venv/
+venv/
+env/
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# Training outputs and model artifacts
+log/
+logs/
+result/
+results/
+*.pt
+*.pth
+
+# OS files
+.DS_Store

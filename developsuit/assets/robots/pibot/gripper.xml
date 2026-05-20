@@ -1,0 +1,91 @@
+<mujoco model="gripper">
+  <compiler angle="radian" meshdir="./meshes/gripper/"/>
+
+  <asset>
+    <mesh name="base_link" file="base_link.STL"/>
+    <mesh name="Left_1_Link" file="Left_1_Link.STL"/>
+    <mesh name="Left_Support_Link" file="Left_Support_Link.STL"/>
+    <mesh name="Left_2_Link" file="Left_2_Link.STL"/>
+    <mesh name="Right_2_Link" file="Right_2_Link.STL"/>
+    <mesh name="Right_1_Link" file="Right_1_Link.STL"/>
+    <mesh name="Right_Support_Link" file="Right_Support_Link.STL"/>
+  </asset>
+
+  <default>
+    <joint damping="1.0" frictionloss="0.05"/>
+  </default>
+
+  <worldbody>
+    <body name="base">
+      <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="base_link"/>
+      <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="base_link"/>
+      <body name="Left_1_Link" pos="0.030141 0 0.10415" quat="0.707105 0.707108 0 0">
+        <inertial pos="0.0202604 0.0187578 0" quat="-0.257975 0.658368 0.257975 0.658368" mass="0.0309053" diaginertia="9.19223e-06 8.92299e-06 3.59913e-07"/>
+        <joint name="Left_1_Joint" pos="0 0 0" axis="0 0 -1" range="-0.91 0" actuatorfrcrange="-10 10"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Left_1_Link"/>
+        <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Left_1_Link"/>
+        <body name="Left_Support_Link" pos="0.040359 0.037365 0">
+          <inertial pos="-0.0177926 0.0354309 -3.45319e-05" quat="0.699435 0.699435 0.10388 0.10388" mass="0.0828693" diaginertia="2.95349e-05 2.83129e-05 4.20884e-06"/>
+          <joint name="Left_Support_Joint" pos="0 0 0" axis="0 0 -1"/>
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Left_Support_Link"/>
+          <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Left_Support_Link"/>
+        </body>
+      </body>
+      <body name="Left_2_Link" pos="0.016 0 0.121" quat="0.707105 0.707108 0 0">
+        <inertial pos="0.0202604 0.0187578 0" quat="-0.257975 0.658368 0.257975 0.658368" mass="0.0309053" diaginertia="9.19223e-06 8.92299e-06 3.59913e-07"/>
+        <joint name="Left_2_Joint" pos="0 0 0" axis="0 0 -1"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Left_2_Link"/>
+        <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Left_2_Link"/>
+      </body>
+
+      <body name="Right_2_Link" pos="-0.016 0 0.121" quat="-2.59734e-06 -2.59735e-06 0.707108 0.707105">
+        <inertial pos="0.0202604 0.0187578 0" quat="-0.257975 0.658368 0.257975 0.658368" mass="0.0309053" diaginertia="9.19223e-06 8.92299e-06 3.59913e-07"/>
+        <joint name="Right_2_Joint" pos="0 0 0" axis="0 0 1"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Right_2_Link"/>
+        <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Right_2_Link"/>
+      </body>
+      <body name="Right_1_Link" pos="-0.030141 0 0.10415" quat="-2.59734e-06 -2.59735e-06 0.707108 0.707105">
+        <inertial pos="0.0202604 0.0187578 0" quat="-0.257975 0.658368 0.257975 0.658368" mass="0.0309053" diaginertia="9.19223e-06 8.92299e-06 3.59913e-07"/>
+        <joint name="Right_1_Joint" pos="0 0 0" axis="0 0 1"/>
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Right_1_Link"/>
+        <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Right_1_Link"/>
+        <body name="Right_Support_Link" pos="0.040359 0.037365 0">
+          <inertial pos="-0.0177926 0.0354309 -2.81888e-08" quat="0.699435 0.699435 0.10388 0.10388" mass="0.0828694" diaginertia="2.95349e-05 2.83129e-05 4.20884e-06"/>
+          <joint name="Right_Support_Joint" pos="0 0 0" axis="0 0 -1"/>
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.615686 0.639216 0.67451 1" mesh="Right_Support_Link"/>
+          <geom type="mesh" rgba="0.615686 0.639216 0.67451 1" mesh="Right_Support_Link"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <equality>
+    <!-- Left_Support_Joint 模仿 Left_1_Joint (multiplier=-1) -->
+    <joint joint1="Left_1_Joint" joint2="Left_Support_Joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+    <!-- Left_2_Joint 模仿 Left_1_Joint (multiplier=1) -->
+    <joint joint1="Left_1_Joint" joint2="Left_2_Joint" polycoef="0 1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+    <!-- Right_2_Joint 模仿 Left_1_Joint (multiplier=-1) -->
+    <joint joint1="Left_1_Joint" joint2="Right_2_Joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+    <!-- Right_1_Joint 模仿 Left_1_Joint (multiplier=-1) -->
+    <joint joint1="Left_1_Joint" joint2="Right_1_Joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+    <!-- Right_Support_Joint 模仿 Left_1_Joint (multiplier=-1) -->
+    <joint joint1="Left_1_Joint" joint2="Right_Support_Joint" polycoef="0 -1 0 0 0" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+  </equality>
+
+  <contact>
+    <exclude body1="base" body2="Left_1_Link"/>
+    <exclude body1="base" body2="Left_Support_Link"/>
+    <exclude body1="base" body2="Right_1_Link"/>
+    <exclude body1="base" body2="Right_Support_Link"/>
+    <exclude body1="Left_1_Link" body2="Left_2_Link"/>
+    <exclude body1="Left_Support_Link" body2="Left_2_Link"/>
+    <exclude body1="Right_1_Link" body2="Right_2_Link"/>
+    <exclude body1="Right_Support_Link" body2="Right_2_Link"/>
+  </contact>
+
+  <actuator>
+    <position name="Left_1_motor" joint="Left_1_Joint" ctrlrange="-0.91 0" kv="1" kp="30"/>
+<!--    <motor name="Left_1_motor" joint="Left_1_Joint" ctrlrange="-1 1"/>-->
+  </actuator>
+
+</mujoco>
