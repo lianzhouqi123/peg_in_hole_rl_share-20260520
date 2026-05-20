@@ -12,13 +12,5 @@ env/
 .vscode/
 .idea/
 
-# Training outputs and model artifacts
-log/
-logs/
-result/
-results/
-*.pt
-*.pth
-
 # OS files
 .DS_Store

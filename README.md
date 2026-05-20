@@ -100,16 +100,3 @@ log/warp_train_fc/
 ```
 
 日志目录会按脚本名和时间戳命名，并保存本次训练的超参数、相关源码路径、环境源码快照和奖励曲线图片。
-
-## GitHub 初始化
-
-如果这是一个全新的分享仓库，可以在项目根目录执行：
-
-```bash
-git add -A
-git commit -m "Initial share version"
-git remote add origin https://github.com/<your-name>/peg_in_hole_rl_share-20260520.git
-git push -u origin main
-```
-
-建议 GitHub 仓库名使用 `peg_in_hole_rl_share-20260520`，避免文件夹名中的方括号带来命令行转义问题。
