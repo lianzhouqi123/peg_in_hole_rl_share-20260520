@@ -28,7 +28,7 @@ os.environ["LIBRARY_PATH"] = ":".join(cuda_stub_paths) + ":" + current_lib_path
 from developsuit.DRL_utils.PPO.Policy import PPO
 from developsuit.DRL_utils.NN.TCN_nn2 import ActorNetwork, PPOValueNetwork
 
-from developsuit.envs.pibot_fc.env_warp_fc_tcnhf2 import Env
+from developsuit.envs.pibot_fc.env_warp_fc_tcnhf2_3 import Env
 
 # ==========================================
 # 🎯 核心测试参数配置
@@ -41,7 +41,7 @@ NUM_ENVS = 500             # 并行环境数 (如果显存不够，可以调小�
 load_file_test = RESULT_ROOT / "warp_train_fc" / "142"  # 记得改环境编号
 # load_name = None
 load_name = "_best"
-env_load_path = RESULT_ROOT / "demo_grasp_stock_left_warp" / "state_pre_put_warp_FC_wrench_bias_1e5.pt"
+env_load_path = RESULT_ROOT / "demo_grasp_stock_left_warp" / "state_pre_put_warp_FC_wrench_bias_wide_1e5.pt"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 run_mode = "test"
